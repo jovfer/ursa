@@ -60,6 +60,13 @@ pub enum BulletproofErrorKind {
     )]
     IncorrectNoOfInputsForMerkleTreeHash { found: usize, expected: usize },
 
+    /// Occurs when Merkle tree is built from incorrect leaf bitmap
+    #[fail(
+        display = "Merkle tree building is called with incorrect leaf bitmap. Expected size {} but found {}",
+        expected, found
+    )]
+    IncorrectSizeOfBitmapForMerkleTree { found: usize, expected: usize },
+
     /// Occurs when a error from Constraint system or gadget is returned.
     #[fail(display = "R1CS Error: {:?}", msg)]
     R1CSError { msg: String },

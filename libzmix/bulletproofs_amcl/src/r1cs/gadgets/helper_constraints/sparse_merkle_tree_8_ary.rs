@@ -1,9 +1,11 @@
-use crate::errors::{BulletproofError, R1CSError};
+use std::collections::VecDeque;
+
+use crate::errors::{BulletproofError, BulletproofErrorKind, R1CSError};
 use crate::r1cs::linear_combination::AllocatedQuantity;
 use crate::r1cs::{ConstraintSystem, LinearCombination, Variable};
 use amcl_wrapper::field_elem::FieldElement;
 
-use super::{constrain_lc_with_scalar, get_bit_count};
+use super::{constrain_lc_with_scalar, get_bit_count, bitmap};
 use crate::r1cs::gadgets::helper_constraints::{get_repr_in_power_2_base, LeafValueType};
 use crate::r1cs::gadgets::merkle_tree_hash::{
     Arity8MerkleTreeHash, Arity8MerkleTreeHashConstraints,
@@ -70,6 +72,103 @@ where
         })
     }
 
+
+    /// Create new tree from leaf bitmap. The cache can be built to be reused in partial storing of the tree.
+    pub fn new_from_bitmap(
+                depth: usize, leaf_bm: &bitmap::Bitmap,
+                hash_func: &'a MTH,
+                db: &mut dyn HashDb<DbVal8ary>,
+                cache: &mut Option<(usize, Vec<FieldElement>)>) -> Result<VanillaSparseMerkleTree8<'a, MTH>, BulletproofError> {
+
+        let capacity: usize = ARITY.pow((depth - 1) as u32) as usize;
+
+        if capacity * ARITY != leaf_bm.len() {
+            return Err(BulletproofErrorKind::IncorrectSizeOfBitmapForMerkleTree {
+                expected: capacity * ARITY, found: leaf_bm.len()
+            }.into())
+        }
+
+        let mut children_at_prev_level: Vec<FieldElement> = Vec::with_capacity(capacity);
+        // Create the value that represents 1 set bit.
+        let one = FieldElement::one();
+        // Create the most common set of children we're going to see.
+        let all_zeros: DbVal8ary = [
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+        ];
+        // Figure out what the hash of all zeros is. We'll use this so often that it's
+        // worth caching.
+        let hash_all_zeros = hash_func.hash(all_zeros.to_vec())?;
+
+        let mut i = 0;
+        while i < leaf_bm.len() {
+            let next8 = leaf_bm.get_byte_for_bit(i);
+            // If any bits are set...
+            if next8 > 0 {
+                let mut siblings = all_zeros.clone();
+                let mut sibling_index = 0;
+                for j in i..i + ARITY {
+                    if leaf_bm.get_bit(j) {
+                        siblings[sibling_index] = one.clone();
+                    }
+                    sibling_index += 1;
+                }
+                let this_hash = hash_func.hash(siblings.to_vec())?;
+                children_at_prev_level.push(this_hash.clone());
+                let this_hash_bytes = this_hash.to_bytes();
+                db.insert(this_hash_bytes, siblings); //TODO extend `HashDb` trait by `contains_key` and check existing before the insert
+            } else {
+                // Nothing to do. All vacant leaf nodes already exist in the sparse tree.
+                children_at_prev_level.push(hash_all_zeros.clone());
+            }
+            i += ARITY;
+        }
+
+        let lvl_idx_to_cache = cache.as_ref().map(|(lvl, _)| *lvl).unwrap_or(depth);
+        for level in (2..depth).rev() {
+            let children_at_this_level = children_at_prev_level;
+            if level == (depth - lvl_idx_to_cache) {
+                if let Some((_, cached_lvl)) = cache.as_mut() {
+                    *cached_lvl = children_at_this_level.clone();
+                }
+            }
+            children_at_prev_level = Vec::new();
+            let next_cnt = children_at_this_level.len() / ARITY;
+            for i in 0..next_cnt {
+                let siblings = &children_at_this_level.as_slice()[i*ARITY..i*ARITY + ARITY];
+                let this_hash = hash_func.hash(siblings.to_vec()).unwrap();
+                children_at_prev_level.push(this_hash.clone());
+                let this_hash_bytes = this_hash.to_bytes();
+                { //TODO extend `HashDb` trait by `contains_key` and check existing before the insert
+                    let array: DbVal8ary = [
+                        siblings[0].clone(),
+                        siblings[1].clone(),
+                        siblings[2].clone(),
+                        siblings[3].clone(),
+                        siblings[4].clone(),
+                        siblings[5].clone(),
+                        siblings[6].clone(),
+                        siblings[7].clone(),
+                    ];
+                    db.insert(this_hash_bytes, array);
+                }
+            }
+        }
+        let root = hash_func.hash(children_at_prev_level)?;
+
+        Ok(VanillaSparseMerkleTree8 {
+            depth,
+            root,
+            hash_func
+        })
+    }
+
     /// Set the given `val` at the given leaf index `idx`
     pub fn update(
         &mut self,
@@ -111,6 +210,55 @@ where
         self.root = cur_val.clone();
 
         Ok(cur_val)
+    }
+
+    pub fn set_leaf_in_cached_tree(&mut self, bitmap: &mut bitmap::Bitmap,
+                                   cache: &mut (usize, Vec<FieldElement>), hash_db: &mut dyn HashDb<DbVal8ary>,
+                                   idx_to_set: usize) -> Result<(), BulletproofError> {
+        let (lvl_idx_to_cache, cached_lvl) = cache;
+        let lvl_idx_to_cache = *lvl_idx_to_cache;
+        let cache_bucket_sz = 1 << (3 * lvl_idx_to_cache);
+        let bucket_num = idx_to_set / cache_bucket_sz;
+        let bucket_offset = bucket_num * cache_bucket_sz;
+
+        let mut bucket_bitmap = bitmap::Bitmap::new(cache_bucket_sz).unwrap();
+        let mut idx = bucket_offset;
+        for bucket_idx in 0..cache_bucket_sz {
+            if bitmap.get_bit(idx) { //TODO copy by word or by byte
+                bucket_bitmap.set_bit(bucket_idx);
+            }
+            idx += 1;
+        }
+        bucket_bitmap.set_bit(idx_to_set - bucket_offset);
+
+        let sub_tree = Self::new_from_bitmap(lvl_idx_to_cache, &bucket_bitmap, &self.hash_func, hash_db, &mut None)?;
+        cached_lvl[bucket_num] = sub_tree.root;
+
+        let mut hashes: VecDeque<FieldElement> = cached_lvl.clone().into();
+        while hashes.len() > 1 {
+            let siblings: Vec<FieldElement> = hashes.drain(0..8).collect();
+            let this_hash = self.hash_func.hash(siblings.clone())?;
+            hashes.push_back(this_hash.clone());
+
+            let this_hash_bytes = this_hash.to_bytes();
+            {
+                let array: DbVal8ary = [
+                    siblings[0].clone(),
+                    siblings[1].clone(),
+                    siblings[2].clone(),
+                    siblings[3].clone(),
+                    siblings[4].clone(),
+                    siblings[5].clone(),
+                    siblings[6].clone(),
+                    siblings[7].clone(),
+                ];
+                hash_db.insert(this_hash_bytes, array);
+            }
+        }
+
+        self.root = hashes.remove(0).unwrap();
+        bitmap.set_bit(idx_to_set);
+        Ok(())
     }
 
     /// Get a value from tree, if `proof` is not None, populate `proof` with the merkle proof
@@ -530,6 +678,46 @@ mod tests {
 
         for i in 0..kvs.len() {
             assert_eq!(kvs[i].1, tree.get(&kvs[i].0, &mut None, &db).unwrap());
+        }
+    }
+
+    #[test]
+    fn update_tree_from_bm_works() {
+        let depth = 5;
+        let lvl_to_cache = 3;
+
+        let width = 9;
+        let mut bm = bitmap::Bitmap::new(1 << (3 * depth)).unwrap();
+        #[cfg(feature = "bls381")]
+        let (full_b, full_e, partial_rounds) = (4, 4, 56);
+
+        #[cfg(feature = "bn254")]
+        let (full_b, full_e, partial_rounds) = (4, 4, 56);
+
+        #[cfg(feature = "secp256k1")]
+        let (full_b, full_e, partial_rounds) = (4, 4, 56);
+
+        #[cfg(feature = "ed25519")]
+        let (full_b, full_e, partial_rounds) = (4, 4, 56);
+
+        let hash_params = PoseidonParams::new(width, full_b, full_e, partial_rounds).unwrap();
+        let hash_func = PoseidonHash8 {
+            params: &hash_params,
+            sbox: &SboxType::Quint,
+        };
+
+        let mut db = InMemoryHashDb::<DbVal8ary>::new();
+        let mut tree = VanillaSparseMerkleTree8::new(&hash_func, depth, &mut db).unwrap();
+        let mut cache = Some((lvl_to_cache, Vec::new()));
+        let mut tree_from_bm = VanillaSparseMerkleTree8::new_from_bitmap(depth, &bm, &hash_func, &mut db, &mut cache).unwrap();
+
+        let mut cache = cache.unwrap();
+        for idx in [1usize, 8 + 2, 8 * 8 + 3, 8 * 8 * 8 + 4].to_vec() {
+            bm.set_bit(idx);
+            tree.update(&FieldElement::from(idx as u64), FieldElement::one(), &mut db).unwrap();
+
+            tree_from_bm.set_leaf_in_cached_tree(&mut bm, &mut cache, &mut db, idx).unwrap();
+            assert_eq!(tree.root, tree_from_bm.root);
         }
     }
 }

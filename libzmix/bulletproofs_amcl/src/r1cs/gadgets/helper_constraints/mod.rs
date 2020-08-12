@@ -7,6 +7,7 @@ use amcl_wrapper::field_elem::FieldElement;
 use rand::{CryptoRng, Rng};
 
 pub mod bit;
+mod bitmap;
 pub mod mimc;
 pub mod non_zero;
 pub mod poseidon;
